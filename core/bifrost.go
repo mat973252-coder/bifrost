@@ -7289,23 +7289,33 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 			bifrost.endCoreSpan(miscSpan)
 			req.sentAt = time.Now()
 
-			// Send error with context awareness to prevent deadlock
-			deliveryTimer.Reset(5 * time.Second)
-			select {
-			case req.Err <- *bifrostError:
-				// Error sent successfully
-			case <-req.Context.Done():
-				// Client no longer listening, log and continue
-				bifrost.logger.Debug("Client context cancelled while sending error response")
-				// The provider already produced this error (possibly after
-				// processing input tokens). tryRequest returned on ctx.Done and will
-				// never receive it, so bill/log it here. Non-streaming only.
+			if req.Context.Err() != nil {
+				// The caller already gave up: tryRequest returned on ctx.Done and will
+				// never read req.Err. Bill/log here deterministically instead of racing
+				// a send into a buffer nobody reads. select picks uniformly among ready
+				// cases, and the cap-1 drained channel makes the send always ready, so
+				// the ctx.Done branch below would win only about half the time (#6972).
+				// The provider already produced this error (possibly after processing
+				// input tokens). Non-streaming only.
+				bifrost.logger.Debug("Client context cancelled before error handoff")
 				bifrost.billAbandonedTerminal(req, nil, bifrostError)
-			case <-deliveryTimer.C:
-				// Timeout to prevent indefinite blocking
-				bifrost.logger.Warn("Timeout while sending error response, client may have disconnected")
+			} else {
+				// Send error with context awareness to prevent deadlock
+				deliveryTimer.Reset(5 * time.Second)
+				select {
+				case req.Err <- *bifrostError:
+					// Error sent successfully
+				case <-req.Context.Done():
+					// The caller left between the check above and the send.
+					bifrost.logger.Debug("Client context cancelled while sending error response")
+					bifrost.billAbandonedTerminal(req, nil, bifrostError)
+				case <-deliveryTimer.C:
+					// Unreachable while req.Err is a cap-1 channel drained on acquire;
+					// kept as the guard if that invariant ever changes.
+					bifrost.logger.Warn("Timeout while sending error response, client may have disconnected")
+				}
+				deliveryTimer.Stop()
 			}
-			deliveryTimer.Stop()
 		} else {
 			// Time the field population as "miscellaneous", then stamp sentAt just before
 			// the send so "worker-handoff" measures only the goroutine hop, not this work.
@@ -7332,6 +7342,14 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 					drainAbandonedStream(stream)
 				}
 				deliveryTimer.Stop()
+			} else if req.Context.Err() != nil {
+				// The caller already gave up: tryRequest returned on ctx.Done and will
+				// never read req.Response. Bill/log here deterministically instead of
+				// racing a send into a buffer nobody reads (see the error path above
+				// for why the select alone is a coin flip, #6972). The provider already
+				// produced this non-streaming result and consumed tokens.
+				bifrost.logger.Debug("Client context cancelled before response handoff")
+				bifrost.billAbandonedTerminal(req, result, nil)
 			} else {
 				// Send response with context awareness to prevent deadlock
 				deliveryTimer.Reset(5 * time.Second)
@@ -7339,14 +7357,12 @@ func (bifrost *Bifrost) requestWorker(provider schemas.Provider, config *schemas
 				case req.Response <- result:
 					// Response sent successfully
 				case <-req.Context.Done():
-					// Client no longer listening, log and continue
+					// The caller left between the check above and the send.
 					bifrost.logger.Debug("Client context cancelled while sending response")
-					// The provider already produced this non-streaming result
-					// (consuming tokens). tryRequest returned on ctx.Done and will never
-					// receive it, so bill/log it here.
 					bifrost.billAbandonedTerminal(req, result, nil)
 				case <-deliveryTimer.C:
-					// Timeout to prevent indefinite blocking
+					// Unreachable while req.Response is a cap-1 channel drained on
+					// acquire; kept as the guard if that invariant ever changes.
 					bifrost.logger.Warn("Timeout while sending response, client may have disconnected")
 				}
 				deliveryTimer.Stop()
